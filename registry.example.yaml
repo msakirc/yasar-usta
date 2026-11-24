@@ -1,0 +1,72 @@
+# Example registry — copy to registry.yaml and edit. One hub, one project block per app.
+# Run: python -m yasar_usta --registry registry.yaml
+
+hub:
+  name: "Yaşar Usta"
+  telegram_token_env: YASAR_USTA_BOT_TOKEN
+  telegram_chat_id_env: TELEGRAM_ADMIN_CHAT_ID
+  log_dir: "${env:LOCALAPPDATA}/YasarUsta/hub"   # hub state out of Dropbox from day 1
+  claude_cmd: "${env:USERPROFILE}/.claude/claude_runner.cmd"    # uses desktop app's claude.exe (auto-finds latest version)
+  messages:                                      # hub's OWN strings (deterministic; not inherited from a project)
+    announce: "🔧 *Bennn... Yaşar Usta!*\n\n{app_name} başlatılıyor..."
+    btn_status: "🔧 Durum"
+    btn_logs: "📋 Loglar"
+    remote_starting: "🖥️ Claude Code oturumu başlatılıyor..."
+    remote_not_found: "❌ `claude` bulunamadı. Claude Code kurulu mu?"
+    remote_started: "🖥️ *Claude Code uzaktan kontrol*\n\n🔗 [Bağlan]({url})\n\nPID: `{pid}`"
+    remote_started_no_url: "🖥️ *Claude Code uzaktan kontrol başladı*\nPID: `{pid}`"
+    remote_failed: "❌ Claude Code başlatılamadı: `{error}`"
+
+projects:
+  kutai:
+    name: Kutay
+    root: "C:/path/to/kutay"
+    venv_python: "${project_root}/.venv/Scripts/python.exe"
+    hook: "${project_root}/yasar_hooks.py"
+    messages:
+      announce: "🔧 *Bennn... Yaşar Usta!*\n\nKutay'ı başlatıyorum..."
+      started: "✅ *Kutay Started*"
+      stopped: "⏹ *Kutay Stopped*\nSend /start to restart."
+      hung: "🔴 Kutay dondu — Yaşar Usta {delay}sn içinde yeniden başlatıyor"
+      restarting: "♻️ *Kutay yeniden başlatılıyor...*"
+      self_restarting: "🔄 *Yaşar Usta yeniden başlatılıyor...*"
+      down_prompt: "⚠️ Kutay durdu. Başlatmak için butona bas."
+      down_reply: "⏸ Kutay şu an kapalı."
+      starting: "🚀 Kutay başlatılıyor..."
+      btn_status: "🔧 Durum"
+      btn_logs: "📋 Loglar"
+      btn_remote: "🖥️ Claude Code"
+      remote_starting: "🖥️ Claude Code oturumu başlatılıyor..."
+      remote_not_found: "❌ `claude` command not found. Claude Code kurulu mu?"
+    targets:
+      - id: orchestrator
+        app_name: Kutay
+        command: ["${project_root}/.venv/Scripts/python.exe", "${project_root}/src/app/run.py"]
+        cwd: "${project_root}"
+        env:
+          NERD_HERD_PROJECT_ROOT: "${project_root}"
+        heartbeat_file: "${state_dir}/orchestrator.heartbeat"
+        heartbeat_stale_seconds: 120        # steady-state hang detection stays fast
+        startup_grace_seconds: 300          # but tolerate a slow cold boot (4.4GB chroma + posthog init blocks the app's own heartbeat) before arming hung-kill (2026-07-24)
+        heartbeat_healthy_seconds: 90
+        restart_exit_code: 42
+        log_dir: "${state_dir}/logs"                        # R3: hot state (shutdown.signal, guard.jsonl, sidecar logs) out of Dropbox
+        log_file: "${project_root}/logs/orchestrator.jsonl" # stays: read by yazbunu's --log-dir ./logs viewer (CWD-relative)
+        stop_timeout: 30
+        claude_name: Kutay
+        claude_cmd: "${env:USERPROFILE}/.claude/claude_runner.cmd"
+        claude_signal_file: "${state_dir}/claude_remote.signal"
+        extra_processes:
+          - {exe: "llama-server.exe", label: "llama-server"}
+        sidecars:
+          - name: yazbunu
+            command: ["${project_root}/.venv/Scripts/python.exe", "-m", "yazbunu.server", "--log-dir", "./logs", "--port", "9880", "--host", "127.0.0.1"]
+            health_url: "http://127.0.0.1:9880/health"
+            pid_file: "${state_dir}/logs/yazbunu.pid"       # R4: hub writes+reads this token end-to-end (sidecar.py:125/58); yazbunu writes no pid
+            detached: true
+          - name: nerd_herd
+            command: ["${project_root}/.venv/Scripts/python.exe", "-m", "nerd_herd", "--port", "9881", "--pid-file", "${state_dir}/logs/nerd_herd.pid", "--db-path", "${project_root}/data/kutai.db"]
+            health_url: "http://127.0.0.1:9881/health"
+            pid_file: "${state_dir}/logs/nerd_herd.pid"     # R4: argv --pid-file (nerd_herd's own write) + hub read, moved in lockstep
+            detached: true
+

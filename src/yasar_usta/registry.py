@@ -1,0 +1,160 @@
+"""Declarative registry loader: registry.yaml -> (HubConfig, [ProjectConfig])."""
+
+from __future__ import annotations
+
+import dataclasses
+import os
+import re
+from pathlib import Path
+
+import yaml
+
+from .config import GuardConfig, HubConfig, Messages, ProjectConfig, SidecarConfig
+
+_ENV_RE = re.compile(r"\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _resolve(value, tokens: dict):
+    """Substitute ${token} and ${env:VAR} placeholders in strings (recursively in lists/dicts)."""
+    if isinstance(value, str):
+        def _env(m):
+            name = m.group(1)
+            val = os.environ.get(name)
+            if val is None:
+                raise ValueError(f"registry references unset env var: {name}")
+            return val
+        value = _ENV_RE.sub(_env, value)
+        for k, v in tokens.items():
+            value = value.replace("${" + k + "}", v)
+        return value
+    if isinstance(value, list):
+        return [_resolve(x, tokens) for x in value]
+    if isinstance(value, dict):
+        return {k: _resolve(v, tokens) for k, v in value.items()}
+    return value
+
+
+# Fields whose values are filesystem paths → normalize separators (Windows).
+_PATH_FIELDS = ("cwd", "log_dir", "log_file", "heartbeat_file",
+                "claude_signal_file", "claude_cmd")
+
+
+def _norm(v):
+    return str(Path(v)) if isinstance(v, str) and v else v
+
+
+def _build_target(raw: dict, tokens: dict) -> GuardConfig:
+    raw = _resolve(raw, tokens)
+    if "id" not in raw or "command" not in raw:
+        raise ValueError(f"target missing id/command: {raw!r}")
+    for k in _PATH_FIELDS:
+        if k in raw:
+            raw[k] = _norm(raw[k])
+    # command[0] and pid_file paths also normalized
+    if isinstance(raw.get("command"), list):
+        raw["command"] = [_norm(raw["command"][0])] + list(raw["command"][1:]) \
+            if raw["command"] else raw["command"]
+    sidecars = []
+    for sc in raw.get("sidecars", []):
+        if sc.get("pid_file"):
+            sc["pid_file"] = _norm(sc["pid_file"])
+        if isinstance(sc.get("command"), list) and sc["command"]:
+            sc["command"] = [_norm(sc["command"][0])] + list(sc["command"][1:])
+        _sc_fields = {f.name for f in dataclasses.fields(SidecarConfig)}
+        sidecars.append(SidecarConfig(**{k: v for k, v in sc.items() if k in _sc_fields}))
+    return GuardConfig(
+        name=raw["id"],
+        app_name=raw.get("app_name", raw["id"]),
+        command=raw["command"],
+        cwd=raw.get("cwd"),
+        env=raw.get("env", {}),
+        heartbeat_file=raw.get("heartbeat_file"),
+        heartbeat_stale_seconds=raw.get("heartbeat_stale_seconds", 120),
+        heartbeat_healthy_seconds=raw.get("heartbeat_healthy_seconds", 90),
+        startup_grace_seconds=raw.get("startup_grace_seconds", 0),
+        restart_exit_code=raw.get("restart_exit_code", 42),
+        log_dir=raw.get("log_dir", "logs"),
+        log_file=raw.get("log_file"),
+        stop_timeout=raw.get("stop_timeout", 30),
+        auto_restart=raw.get("auto_restart", True),
+        auto_start=raw.get("auto_start", True),
+        backoff_steps=raw.get("backoff_steps", [5, 15, 60, 300]),
+        claude_enabled=raw.get("claude_enabled", True),
+        claude_cmd=raw.get("claude_cmd"),
+        claude_name=raw.get("claude_name"),
+        claude_signal_file=raw.get("claude_signal_file"),
+        sidecars=sidecars,
+        extra_processes=raw.get("extra_processes", []),
+    )
+
+
+def load_registry(path, project_root: str) -> tuple[HubConfig, list[ProjectConfig]]:
+    """Parse registry.yaml. Fail fast on structural error (no partial start)."""
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or "projects" not in data:
+        raise ValueError("registry.yaml must have a top-level 'projects' mapping")
+
+    tokens = {"project_root": project_root}
+
+    _msg_fields = {f.name for f in dataclasses.fields(Messages)}
+
+    raw_hub = data.get("hub", {})
+    raw_hub_msgs = raw_hub.get("messages")
+    hub_msgs = Messages()
+    if raw_hub_msgs:
+        hub_msgs = Messages(**{k: v for k, v in raw_hub_msgs.items() if k in _msg_fields})
+    hub = HubConfig(
+        name=raw_hub.get("name", "Yaşar Usta"),
+        telegram_token=os.getenv(raw_hub.get("telegram_token_env", ""), ""),
+        telegram_chat_id=os.getenv(raw_hub.get("telegram_chat_id_env", ""), ""),
+        log_dir=_norm(_resolve(raw_hub.get("log_dir", "logs"), tokens)),
+        claude_enabled=raw_hub.get("claude_enabled", True),
+        claude_cmd=_norm(_resolve(raw_hub.get("claude_cmd"), tokens)),
+        messages=hub_msgs,
+    )
+
+    projects: list[ProjectConfig] = []
+    for pid, raw_proj in data["projects"].items():
+        proj_root = raw_proj.get("root", project_root)
+        localappdata = os.environ.get("LOCALAPPDATA", "")
+        default_state = f"{localappdata}/YasarUsta/{pid}" if localappdata else f"{proj_root}/logs"
+        state_dir = raw_proj.get("state_dir", default_state)
+        proj_tokens = {"project_root": proj_root, "state_dir": state_dir}
+        if "targets" not in raw_proj or not raw_proj["targets"]:
+            raise ValueError(f"project {pid!r} has no targets")
+        targets = [_build_target(t, proj_tokens) for t in raw_proj["targets"]]
+        # R2 gate: targets in one project share proj.state_dir, so two identical
+        # heartbeat_file specs resolve to the same path — the writes clobber and
+        # the hung-detector reads the wrong target. Reject at load, not runtime.
+        seen_hb: dict[str, str] = {}
+        for t in targets:
+            if not t.heartbeat_file:
+                continue
+            key = os.path.normcase(os.path.normpath(t.heartbeat_file))
+            if key in seen_hb:
+                raise ValueError(
+                    f"project {pid!r}: targets {seen_hb[key]!r} and {t.name!r} both "
+                    f"use heartbeat_file={t.heartbeat_file!r} — each target in a "
+                    f"project must have a distinct heartbeat file"
+                )
+            seen_hb[key] = t.name
+        raw_msgs = raw_proj.get("messages")
+        msgs = None
+        if raw_msgs:
+            msgs = Messages(**{k: v for k, v in raw_msgs.items() if k in _msg_fields})
+            # Targets inherit their project's messages at parse time (single
+            # source of truth). Previously done in __main__, which also — as a
+            # side effect — clobbered the hub's messages with the last project's.
+            for t in targets:
+                t.messages = msgs
+        projects.append(ProjectConfig(
+            id=pid,
+            name=raw_proj.get("name", pid),
+            targets=targets,
+            hook_module=raw_proj.get("hook_module"),
+            venv_python=_norm(_resolve(raw_proj.get("venv_python"), proj_tokens)),
+            hook_path=_norm(_resolve(raw_proj.get("hook"), proj_tokens)),
+            messages=msgs,
+            state_dir=_norm(state_dir),
+        ))
+    return hub, projects

@@ -10,17 +10,32 @@ Manages any subprocess with:
 - Configurable i18n for all user-facing strings
 """
 
-from .config import GuardConfig, Messages, SidecarConfig
-from .guard import ProcessGuard
-from .heartbeat import EXIT_RESTART, EXIT_STOP, HeartbeatWriter, write_heartbeat
+from .config import GuardConfig, HubConfig, Messages, ProjectConfig, SidecarConfig
+from .heartbeat import (
+    EXIT_RESTART,
+    EXIT_STOP,
+    HeartbeatWriter,
+    read_state_snapshot,
+    write_heartbeat,
+    write_state_snapshot,
+)
+from .hub import Hub
+from .registry import load_registry
+from .supervisor import TargetSupervisor
 
 __all__ = [
-    "ProcessGuard",
     "GuardConfig",
+    "Hub",
+    "HubConfig",
     "Messages",
+    "ProjectConfig",
     "SidecarConfig",
+    "TargetSupervisor",
+    "load_registry",
     "EXIT_RESTART",
     "EXIT_STOP",
     "HeartbeatWriter",
+    "read_state_snapshot",
     "write_heartbeat",
+    "write_state_snapshot",
 ]

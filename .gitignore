@@ -1,13 +1,6 @@
-__pycache__/
-*.py[cod]
 *.egg-info/
-dist/
-build/
-*.egg
-.pytest_cache/
+__pycache__/
 .venv/
-venv/
-*.log
 .env
-.DS_Store
-Thumbs.db
+__pycache__/
+*.egg-info/

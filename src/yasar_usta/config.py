@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 
 @dataclass
@@ -32,9 +33,13 @@ class Messages:
     starting: str = "🚀 Starting {app_name}..."
 
     # Keyboard
-    btn_start: str = "▶️ Start"
+    btn_start: str = "▶️ Start {app_name}"
     btn_status: str = "🔧 Status"
     btn_system: str = "⚙️ System"
+    btn_restart: str = "🔄 Restart {app_name}"
+    btn_stop: str = "⏹ Stop {app_name}"
+    btn_logs: str = "📋 Logs"
+    btn_remote: str = "🖥️ Claude Code"
     btn_refresh: str = "🔄 Refresh"
     btn_restart_guard: str = "♻️ Restart {name}"
     btn_restart_sidecar: str = "📊 Restart {sidecar_name}"
@@ -78,17 +83,24 @@ class SidecarConfig:
     detached: bool = True
     auto_start: bool = True
     auto_restart: bool = True
+    env: dict = field(default_factory=dict)
 
 
 @dataclass
 class GuardConfig:
-    """All configuration for ProcessGuard."""
+    """Per-target process configuration (consumed by TargetSupervisor).
+
+    Named ``GuardConfig`` for back-compat with the pre-hub ProcessGuard era
+    (that class is retired); the shape is unchanged so registry.yaml and the
+    supervisor keep working. Rename is a separate, mechanical follow-up.
+    """
 
     # What to manage
     name: str = "Yaşar Usta"
     app_name: str = "App"
     command: list[str] = field(default_factory=list)
     cwd: str | None = None
+    env: dict = field(default_factory=dict)  # merged onto os.environ at spawn
 
     # Telegram
     telegram_token: str = ""
@@ -102,6 +114,10 @@ class GuardConfig:
     heartbeat_file: str | None = None
     heartbeat_stale_seconds: int = 120
     heartbeat_healthy_seconds: int = 90
+    # Grace window after (re)start during which a stale heartbeat does NOT
+    # trigger a hung-kill — lets a slow-booting target (heavy init that blocks
+    # its own heartbeat) finish coming up. 0 = disabled (kill as soon as stale).
+    startup_grace_seconds: int = 0
 
     # Exit codes
     restart_exit_code: int = 42
@@ -112,6 +128,7 @@ class GuardConfig:
 
     # Process management
     auto_restart: bool = True
+    auto_start: bool = True
     stop_timeout: int = 30
 
     # Claude Code remote
@@ -120,11 +137,11 @@ class GuardConfig:
     claude_name: str | None = None
     claude_signal_file: str | None = None
 
-    # Sidecar (log viewer etc.)
-    sidecar: SidecarConfig | None = None
+    # Sidecars (log viewer, observability, etc.)
+    sidecars: list[SidecarConfig] = field(default_factory=list)
 
     # Hooks
-    on_exit: None = None  # callable(exit_code: int) -> None, called after process exits
+    on_exit: Callable[[int], None] | None = None  # called after process exits
 
     # i18n
     messages: Messages = field(default_factory=Messages)
@@ -134,3 +151,31 @@ class GuardConfig:
 
     # Extra process names to check in status panel
     extra_processes: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class HubConfig:
+    """Hub-level config: the single shared Telegram bot + hub lock/log dir."""
+
+    name: str = "Yaşar Usta"
+    telegram_token: str = ""
+    telegram_chat_id: str = ""
+    log_dir: str = "logs"  # where the hub lock + hub meta log live
+    messages: Messages = field(default_factory=Messages)
+    # Claude Code remote (hub self-launcher). claude_cmd=None → auto-discover.
+    claude_enabled: bool = True
+    claude_cmd: str | None = None
+
+
+@dataclass
+class ProjectConfig:
+    """One project = a display name + N targets + an optional hook module."""
+
+    id: str
+    name: str
+    targets: list[GuardConfig] = field(default_factory=list)
+    hook_module: str | None = None
+    venv_python: str | None = None
+    hook_path: str | None = None
+    state_dir: str | None = None   # Phase 2; harmless now
+    messages: Messages | None = None

@@ -1,0 +1,666 @@
+"""Hub — owns the shared Telegram poller, the single lock, N supervisors,
+the dashboard, coordinated shutdown, and hub self-restart."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import sys
+import time
+from pathlib import Path
+
+from .commands import (build_dashboard_keyboard, build_hub_reply_keyboard,
+                       format_log_entries)
+from .config import HubConfig, ProjectConfig
+from .heartbeat import HeartbeatWriter
+from .hooks import run_pre_boot, run_hook_subprocess
+from .lock import acquire_lock, release_lock
+from .singleton import (_win32_create_mutex, enforce_singleton,
+                        release_singleton)
+from .status import build_dashboard_text
+from .supervisor import TargetSupervisor
+from .telegram import TelegramAPI
+
+logger = logging.getLogger("yasar_usta.hub")
+
+import subprocess as _subprocess
+
+
+def build_restart_command(registry_args: list) -> list:
+    """Return the argv list for a hub self-restart via ``python -m yasar_usta``.
+
+    Using ``-m yasar_usta`` (rather than the bare ``__main__.py`` path) keeps
+    package-relative imports working in the spawned process.
+    """
+    return [sys.executable, "-m", "yasar_usta"] + list(registry_args)
+
+
+# The Layer-0 Task Scheduler task name (registered by
+# scripts/install_yasar_autostart.ps1). Kept in sync with that installer.
+_SCHEDULED_TASK_NAME = "YasarUsta"
+
+
+def build_tracked_restart_command(registry_args: list) -> list:
+    """Return argv for a detached helper that relaunches the hub as a *tracked*
+    Task Scheduler instance (I1), instead of an untracked ``Popen`` orphan.
+
+    The helper sleeps ~2s so THIS hub process fully exits first — releasing the
+    singleton mutex and ending the running task instance, so the task's
+    ``IgnoreNew`` does not suppress the relaunch — then triggers ``schtasks
+    /Run``. If the task is not registered (a dev box with no Phase-4 install),
+    it falls back to a direct ``-m yasar_usta`` spawn, so /restart_hub still
+    works everywhere. The fallback inherits the helper's CWD (the hub root),
+    which the caller sets, so ``__main__.load_dotenv`` still finds the hub .env.
+    """
+    fallback = build_restart_command(registry_args)
+    code = (
+        "import time,subprocess\n"
+        "time.sleep(2)\n"
+        "try:\n"
+        f"    ok=subprocess.run(['schtasks','/Run','/TN','{_SCHEDULED_TASK_NAME}']).returncode==0\n"
+        "except Exception:\n"
+        "    ok=False\n"
+        "if not ok:\n"
+        f"    subprocess.Popen({fallback!r}, creationflags=0x00000008|0x08000000)\n"
+    )
+    return [sys.executable, "-c", code]
+
+
+def assert_consumer_imports(projects) -> None:
+    """Each project's venv must resolve the heartbeat client symbols before we
+    manage its child. Fail loud (SystemExit) rather than a late ImportError."""
+    for p in projects:
+        vp = getattr(p, "venv_python", None)
+        if not vp:
+            continue
+        try:
+            r = _subprocess.run(
+                [vp, "-c", "from yasar_usta import HeartbeatWriter, write_heartbeat"],
+                capture_output=True, text=True, timeout=30)
+        except Exception as e:
+            raise SystemExit(f"[Yasar Usta] cannot probe {p.id} venv {vp}: {e}")
+        if r.returncode != 0:
+            raise SystemExit(
+                f"[Yasar Usta] project {p.id}: 'yasar_usta' not importable in {vp}. "
+                f"Run: pip install -e ../yasar_usta in that venv. ({(r.stderr or '').strip()})")
+
+
+def assert_hub_log_dir_absolute(cfg) -> None:
+    if not os.path.isabs(cfg.log_dir):
+        raise SystemExit(
+            f"[Yasar Usta] hub log_dir is relative ({cfg.log_dir!r}) — refusing to "
+            "scatter state in CWD. Set an absolute ${state_dir}/LOCALAPPDATA path in registry.yaml.")
+
+
+def assert_hub_credentials(cfg) -> None:
+    if not getattr(cfg, "telegram_token", ""):
+        raise SystemExit(
+            "[Yasar Usta] YASAR_USTA_BOT_TOKEN is empty — refusing to boot a "
+            "credential-less hub (alerts would be silently dark). Check the hub .env.")
+
+
+class Hub:
+    def __init__(self, hub_cfg: HubConfig, projects: list[ProjectConfig]):
+        self.cfg = hub_cfg
+        self.msgs = hub_cfg.messages
+        self.projects = projects
+        self.telegram = TelegramAPI(hub_cfg.telegram_token, hub_cfg.telegram_chat_id)
+        self._guard_start_time = time.time()
+        self._shutdown = False
+        self._telegram_poller: asyncio.Task | None = None
+        self._bg_tasks: set = set()  # strong refs to fire-and-forget tasks
+        # Singleton seam (injectable for tests); real Win32 mutex by default.
+        self._create_mutex = _win32_create_mutex
+        self._singleton_exit = sys.exit
+
+        # Claude Code launchers: hub self + one per project. Labels come from
+        # .name (Messages-independent → deterministic regardless of registry
+        # order). Routing in _route_text is by exact label equality, so labels
+        # MUST be unique — fail loud at boot on a collision.
+        # "__pc__" is a GLOBAL (not project-scoped) Claude launcher for PC-wide
+        # management tasks — rooted at the user's home dir, separate session dir.
+        self._launchers = [
+            ("🖥️ " + hub_cfg.name, "__hub__"),
+            ("💻 PC", "__pc__"),
+        ]
+        for proj in projects:
+            # Route to a REAL supervisor routing id, mirroring the keying below:
+            # single-target → proj.id; multi-target → the first target's
+            # `${proj.id}:${tgt.name}`. A multi-target project has no supervisor
+            # keyed by the bare proj.id, so routing the launcher there would be a
+            # silent no-op (the dead-Bilinç-button bug after bilinc_sentinel).
+            rid = proj.id if len(proj.targets) == 1 else f"{proj.id}:{proj.targets[0].name}"
+            self._launchers.append(("🖥️ " + proj.name, rid))
+        _labels = [lbl for lbl, _ in self._launchers]
+        if len(set(_labels)) != len(_labels):
+            raise SystemExit(
+                "[Yasar Usta] Claude launcher labels collide: "
+                f"{_labels} — hub/project display names must be unique.")
+        self._remote_buttons = {lbl: rid for lbl, rid in self._launchers}
+
+        # Persistent reply keyboard, built once from hub Messages + launchers.
+        self._reply_kb = build_hub_reply_keyboard(self.msgs, self._launchers)
+
+        # One supervisor per target, keyed by a unique routing id. Single-target
+        # project → routing id is the project id; multi-target → `${pid}:${tgt}`.
+        self.supervisors: dict[str, TargetSupervisor] = {}
+        for proj in projects:
+            for tgt in proj.targets:
+                # on_exit fires KutAI's llama-server/Ollama orphan-kill on a
+                # non-clean exit — dispatched as a subprocess in the project's
+                # own venv so the hub never imports project packages (§4).
+                tgt.on_exit = self._make_on_exit(proj)
+                single = len(proj.targets) == 1
+                rid = proj.id if single else f"{proj.id}:{tgt.name}"
+                display = proj.name if single else f"{proj.name} · {tgt.app_name}"
+                self.supervisors[rid] = TargetSupervisor(
+                    rid, tgt, notify=self._notify, reply_keyboard=self._reply_kb,
+                    display_name=display, state_dir=proj.state_dir)
+
+    @staticmethod
+    def _make_on_exit(proj):
+        """Build a per-project on_exit that dispatches the on_exit hook as a
+        subprocess. `_proj` default-binds so the closure is not late-bound to
+        the last project in the loop."""
+        def _on_exit(exit_code, _proj=proj):
+            run_hook_subprocess(_proj, "on_exit", {"exit_code": exit_code})
+        return _on_exit
+
+    async def _notify(self, text: str, reply_markup: dict | None = None) -> None:
+        result = await self.telegram.send(text, reply_markup=reply_markup)
+        if result and not result.get("ok"):
+            await self.telegram.send(text, reply_markup=reply_markup, parse_mode=None)
+
+    def _hub_alive_path(self) -> str:
+        """The hub self-liveness file the outer watchdog reads (§7)."""
+        return str(Path(self.cfg.log_dir) / "hub.alive")
+
+    # ── Single-instance gate (never-duplicates authority) ────────────────
+    def _acquire_singleton(self) -> None:
+        """Become the one hub, or exit. Runs before the file lock so no other
+        cleanup/pre_boot executes on a mutex-loser (§4.1). Fail-closed."""
+        enforce_singleton(
+            "YasarUstaHub",
+            state_dir=self.cfg.log_dir,
+            create_mutex=self._create_mutex,
+            alert=self._sync_alert,
+            exit_fn=self._singleton_exit,
+        )
+
+    def _sync_alert(self, msg: str) -> None:
+        """Best-effort BLOCKING Telegram post — usable before the async poller
+        exists (the mutex gate runs pre-loop). Never raises."""
+        token = getattr(self.cfg, "telegram_token", "")
+        chat = getattr(self.cfg, "telegram_chat_id", "")
+        if not token or not chat:
+            logger.error("SINGLETON: %s", msg)
+            return
+        try:
+            import urllib.parse
+            import urllib.request
+            data = urllib.parse.urlencode({"chat_id": chat, "text": msg}).encode()
+            urllib.request.urlopen(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data=data, timeout=5)
+        except Exception:
+            logger.error("SINGLETON (alert send failed): %s", msg)
+
+    def _kb(self) -> dict:
+        return self._reply_kb
+
+    def _resolve_bare_target(self) -> "TargetSupervisor | None":
+        if len(self.supervisors) == 1:
+            return next(iter(self.supervisors.values()))
+        return None
+
+    async def _sidecar_health(self, sc) -> dict:
+        http = await sc.http_alive()
+        pid = sc.pid_alive()
+        return {"name": sc.name, "http_alive": http, "pid": pid,
+                "alive": bool(http or pid)}
+
+    # ── Dashboard ────────────────────────────────────────────────────────
+    async def _send_dashboard(self, edit_message_id: int | None = None) -> None:
+        # Gather sidecar health on the loop (aiohttp http_alive can't run in the
+        # worker thread), THEN offload the blocking text render via to_thread.
+        try:
+            states = []
+            for s in self.supervisors.values():
+                st = s.status()
+                st["sidecar_health"] = list(await asyncio.gather(
+                    *[self._sidecar_health(sc) for sc in s.sidecars.values()]
+                )) if s.sidecars else []
+                states.append(st)
+            text = await asyncio.to_thread(
+                build_dashboard_text, self.cfg.name, states, self._guard_start_time)
+            kb = build_dashboard_keyboard(states, hub_name=self.cfg.name)
+            if edit_message_id:
+                result = await self.telegram.edit(edit_message_id, text, reply_markup=kb)
+                if result and not result.get("ok"):
+                    await self.telegram.edit(edit_message_id, text, reply_markup=kb, parse_mode=None)
+            else:
+                result = await self.telegram.send(text, reply_markup=kb)
+                if result and not result.get("ok"):
+                    await self.telegram.send(text, reply_markup=kb, parse_mode=None)
+        except Exception as e:
+            logger.error("dashboard failed: %s", e)
+            try:
+                await self.telegram.send(f"⚠️ Dashboard error: {e}")
+            except Exception:
+                pass
+
+    # ── Callback routing ─────────────────────────────────────────────────
+    async def _route_callback(self, cb_data: str, cb_msg_id) -> None:
+        if cb_data == "dashboard_refresh":
+            await self._send_dashboard(edit_message_id=cb_msg_id)
+            return
+        if cb_data == "restart_hub":
+            # Downs every project → confirm first (never a mis-tap).
+            await self.telegram.send(
+                f"🔁 *{self.cfg.name} yeniden başlatılsın mı?*\n"
+                "Tüm projeler kısa süre durur.",
+                reply_markup={"inline_keyboard": [[
+                    {"text": "✅ Evet", "callback_data": "confirm_restart_hub"},
+                    {"text": "❌ Vazgeç", "callback_data": "confirm_cancel"},
+                ]]})
+            return
+        if cb_data == "confirm_restart_hub":
+            if cb_msg_id:
+                await self.telegram.delete(cb_msg_id)
+            await self._notify(f"🔁 *{self.cfg.name} yeniden başlatılıyor...*")
+            await self._do_restart_hub()
+            return
+        if cb_data == "confirm_shutdown_hub":
+            if cb_msg_id:
+                await self.telegram.delete(cb_msg_id)
+            await self._notify(f"🛑 *{self.cfg.name} durduruluyor...*")
+            await self._do_shutdown_hub()
+            return
+        if cb_data == "confirm_cancel":
+            if cb_msg_id:
+                await self.telegram.delete(cb_msg_id)
+            return
+        if cb_data.startswith("restart_sidecar:"):
+            rest = cb_data[len("restart_sidecar:"):]
+            pid, _, name = rest.rpartition(":")
+            sup = self.supervisors.get(pid)
+            sc = sup.sidecars.get(name) if sup else None
+            if sc:
+                await self._notify(f"📊 *{name}* yeniden başlatılıyor...")
+                await sc.stop()
+                await sc.start()
+                await self._notify(f"✅ *{name}* yeniden başlatıldı")
+            return
+        if cb_data == "remote:__hub__":
+            t = asyncio.create_task(self._handle_self_remote())
+            self._bg_tasks.add(t)
+            t.add_done_callback(self._bg_tasks.discard)
+            return
+        if cb_data == "remote:__pc__":
+            t = asyncio.create_task(self._handle_pc_remote())
+            self._bg_tasks.add(t)
+            t.add_done_callback(self._bg_tasks.discard)
+            return
+        if ":" not in cb_data:
+            return
+        verb, pid = cb_data.split(":", 1)
+        sup = self.supervisors.get(pid)
+        if not sup:
+            return
+        # restart/stop are semi-destructive → confirm first (review finding #5).
+        if verb == "restart":
+            await self._confirm(pid, sup.cfg.app_name, "restart",
+                                f"🔄 *{sup.cfg.app_name} yeniden başlatılsın mı?*")
+        elif verb == "stop":
+            await self._confirm(pid, sup.cfg.app_name, "stop",
+                                f"⚠️ *{sup.cfg.app_name} durdurulsun mu?*\n"
+                                "Manuel olarak yeniden başlatmanız gerekecek.")
+        elif verb == "confirm_restart":
+            if cb_msg_id:
+                await self.telegram.delete(cb_msg_id)
+            await self._notify(f"♻️ *{sup.cfg.app_name} yeniden başlatılıyor...*")
+            sup.request_restart()
+            await sup.do_restart_now()
+        elif verb == "confirm_stop":
+            if cb_msg_id:
+                await self.telegram.delete(cb_msg_id)
+            await self._notify(f"⏹ *{sup.cfg.app_name} durduruluyor...*")
+            sup.request_stop()
+            await sup.do_stop_now()
+        elif verb == "start":
+            await self._notify(f"🚀 {sup.cfg.app_name} başlatılıyor...")
+            await sup.request_start()
+        elif verb == "kill":
+            await sup.kill_now()
+            await sup._send_start_prompt(f"🔴 {sup.cfg.app_name} not responding.")
+        elif verb == "remote":
+            t = asyncio.create_task(sup._handle_remote())
+            self._bg_tasks.add(t)
+            t.add_done_callback(self._bg_tasks.discard)
+        elif verb == "logs":
+            await self._send_logs_for(sup)
+
+    async def _confirm(self, pid: str, app_name: str, action: str, prompt: str) -> None:
+        """Send a Yes/Cancel dialog whose Yes carries confirm_{action}:{pid}."""
+        await self.telegram.send(prompt, reply_markup={"inline_keyboard": [[
+            {"text": "✅ Evet", "callback_data": f"confirm_{action}:{pid}"},
+            {"text": "❌ Vazgeç", "callback_data": "confirm_cancel"},
+        ]]})
+
+    async def _send_logs_for(self, sup: TargetSupervisor, n: int = 20) -> None:
+        log_path = sup.cfg.log_file or str(Path(sup.cfg.log_dir) / "orchestrator.jsonl")
+        formatted = format_log_entries(log_path, n)
+        if formatted is None:
+            await self._notify("📋 No log entries.")
+            return
+        yaz = sup.sidecars.get("yazbunu")
+        if yaz and getattr(yaz, "health_url", None) and await yaz.http_alive():
+            url = yaz.health_url.replace("/health", "/")
+            formatted += f"\n\n📊 [Yazbunu Log Viewer]({url})"
+        await self._notify(formatted)
+
+    # ── Claude Code: hub self-launcher ──────────────────────────────────
+    async def _handle_self_remote(self) -> None:
+        """Start a `claude remote-control` session in the hub's own repo root.
+
+        The hub has no supervisor, so this mirrors `TargetSupervisor._handle_remote`
+        via the shared helper. cwd is the hub repo root (three parents up from
+        this file); session files live under the hub's out-of-Dropbox log_dir.
+        """
+        from .remote import announce_and_launch, find_claude_cmd
+        cmd = find_claude_cmd(self.cfg.claude_cmd) if self.cfg.claude_enabled else None
+        session_dir = str(Path(self.cfg.log_dir) / "claude_sessions")
+        repo_root = str(Path(__file__).resolve().parents[2])
+        await announce_and_launch(
+            self._notify, self.msgs, cmd,
+            name=self.cfg.name, cwd=repo_root,
+            session_dir=session_dir, label="hub",
+        )
+
+    # ── Claude Code: PC-management launcher (global, not project-scoped) ──
+    async def _handle_pc_remote(self) -> None:
+        """Start a `claude remote-control` session in the user's home dir for
+        PC-wide management tasks not tied to any single project repo.
+
+        Mirrors `_handle_self_remote` but roots cwd at the home directory and
+        uses its own session dir so PC sessions don't mix with hub sessions.
+        Reuses the hub's Claude settings (claude_cmd / claude_enabled).
+        """
+        from .remote import announce_and_launch, find_claude_cmd
+        cmd = find_claude_cmd(self.cfg.claude_cmd) if self.cfg.claude_enabled else None
+        session_dir = str(Path(self.cfg.log_dir) / "claude_sessions_pc")
+        # Root at the Workspaces folder (the repo's parent dir), so PC-management
+        # sessions span all projects, not a single repo. hub.py is at
+        # src/yasar_usta/hub.py → parents[2] = repo root, parents[3] = Workspaces.
+        workspaces = str(Path(__file__).resolve().parents[3])
+        await announce_and_launch(
+            self._notify, self.msgs, cmd,
+            name="PC", cwd=workspaces,
+            session_dir=session_dir, label="pc",
+        )
+
+    # ── Hub self-restart (spec finding #1) ───────────────────────────────
+    async def _do_restart_hub(self) -> None:
+        self._shutdown = True
+        for sup in self.supervisors.values():
+            sup.request_shutdown()
+            await sup.do_stop_now()
+        await self._stop_poller()
+        await self.telegram.flush_updates()
+        import subprocess as _sp
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = (
+                _sp.CREATE_NEW_PROCESS_GROUP | _sp.DETACHED_PROCESS | _sp.CREATE_NO_WINDOW)
+        # Release the singleton mutex + file lock BEFORE re-spawning, so the
+        # replacement hub acquires a free mutex instead of deadlocking on the
+        # one we still hold (zero-hub window). The old process is already
+        # quiesced (supervisors + poller stopped) so there is no double-work.
+        release_singleton()
+        release_lock()
+        # Restart via `-m yasar_usta` (package imports resolve); pin CWD to the
+        # hub repo root so __main__.load_dotenv() finds the hub .env on restart.
+        # hub.py is at src/yasar_usta/hub.py → parents[2] is the repo root.
+        _hub_root = str(Path(__file__).resolve().parents[2])
+        # Relaunch as a TRACKED Task Scheduler instance (I1), not an untracked
+        # Popen orphan: a detached helper waits for THIS process to exit, then
+        # triggers `schtasks /Run` (falling back to a direct spawn off-Scheduler).
+        # Then exit 0 — a deliberate restart is a clean handoff, NOT a failure,
+        # so the scheduler does not ALSO relaunch/flag it. This avoids the
+        # mutex-bounce churn + "task shows failed while the hub runs" diagnostics
+        # of the old exit-42 self-Popen path.
+        _sp.Popen(build_tracked_restart_command(sys.argv[1:]), close_fds=True,
+                  cwd=_hub_root, **kwargs)
+        os._exit(0)
+
+    # ── Hub deliberate shutdown (stopped-gate create-half, R1) ───────────
+    async def _do_shutdown_hub(self) -> None:
+        """Deliberate, staying-down stop (the `/shutdown_hub` command).
+
+        Unlike `_do_restart_hub`, this does NOT relaunch: it writes the
+        `hub.stopped` sentinel — the create-half the watchdog's deliberate-stop
+        gate was waiting on — then exits 0 so Task Scheduler's restart-on-failure
+        does NOT bring the hub back. The sentinel is written BEFORE quiescing so
+        the 3-min watchdog can never race a kill against a hub going down on
+        purpose. The stop STAYS down: `Hub.run()` honors the same sentinel (I2)
+        and refuses to start under the keep-alive trigger or a logon — so a
+        deliberate stop survives reboots. The user restarts explicitly via
+        start_kutai.bat (which deletes the marker before `schtasks /Run`), or by
+        removing `%LOCALAPPDATA%\\YasarUsta\\hub\\hub.stopped` (the keep-alive
+        then brings it back within 3 min).
+        """
+        self._shutdown = True
+        try:
+            d = Path(self.cfg.log_dir)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "hub.stopped").write_text(str(time.time()))
+        except Exception as e:
+            logger.error("shutdown: could not write hub.stopped sentinel: %s", e)
+        for sup in self.supervisors.values():
+            sup.request_shutdown()
+            await sup.do_stop_now()
+        await self._stop_poller()
+        await self.telegram.flush_updates()
+        release_singleton()
+        release_lock()
+        os._exit(0)
+
+    async def _stop_poller(self) -> None:
+        if self._telegram_poller:
+            self._telegram_poller.cancel()
+            try:
+                await self._telegram_poller
+            except asyncio.CancelledError:
+                pass
+            self._telegram_poller = None
+        await self.telegram.close()
+
+    def request_shutdown(self) -> None:
+        self._shutdown = True
+        for sup in self.supervisors.values():
+            sup.request_shutdown()
+
+    async def _shutdown_watcher(self) -> None:
+        """When shutdown is requested, fan out a graceful stop to every
+        supervisor so their run() loops wake and exit promptly (spec: Hub
+        fans out stop(timeout) on shutdown). Otherwise this task idles until
+        cancelled by run()."""
+        while not self._shutdown:
+            await asyncio.sleep(0.5)
+        for sup in self.supervisors.values():
+            try:
+                await sup.do_stop_now()
+            except Exception as e:
+                logger.error("shutdown stop for %s failed: %s", sup.project_id, e)
+
+    # ── Poll loop ────────────────────────────────────────────────────────
+    async def _poll_loop(self, initial_offset: int = 0) -> None:
+        offset = initial_offset
+        fail = 0
+        logger.info("Hub poller started")
+        while True:
+            try:
+                updates = await self.telegram.get_updates(offset=offset)
+                fail = 0
+                if not updates:
+                    continue
+                offset = max(u["update_id"] for u in updates) + 1
+                for update in updates:
+                    cb = update.get("callback_query")
+                    if cb:
+                        chat = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+                        if chat == str(self.cfg.telegram_chat_id):
+                            await self.telegram.answer_callback(cb["id"])
+                            await self._route_callback(
+                                cb.get("data", ""),
+                                cb.get("message", {}).get("message_id"))
+                        continue
+                    msg = update.get("message", {})
+                    text = msg.get("text", "")
+                    chat_id = str(msg.get("chat", {}).get("id", ""))
+                    if chat_id != str(self.cfg.telegram_chat_id):
+                        continue
+                    await self._route_text(text)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                fail += 1
+                if fail <= 3 or fail % 60 == 0:
+                    logger.error("Hub poll error (#%d): %s", fail, e)
+                await asyncio.sleep(5)
+
+    async def _route_text(self, text: str) -> None:
+        # Hub-global: dashboard (slash OR the persistent "Status" button label)
+        if text.startswith("/status") or text.startswith("/kutai_status") \
+                or text == self.msgs.btn_status:
+            await self._send_dashboard()
+            return
+        if text.startswith("/restart_hub") or text.startswith("/restart_usta") \
+                or text.startswith("/restart_guard"):
+            await self._notify("♻️ *Hub yeniden başlatılıyor...*")
+            await self._do_restart_hub()
+            return
+        # Deliberate, staying-down stop (writes hub.stopped, no relaunch) —
+        # destructive (downs every project until next logon) → confirm first.
+        if text.startswith("/shutdown_hub") or text.startswith("/stop_hub"):
+            await self.telegram.send(
+                f"🛑 *{self.cfg.name} tamamen durdurulsun mu?*\n"
+                "Tüm projeler durur ve sonraki oturum açılışına kadar kapalı kalır.",
+                reply_markup={"inline_keyboard": [[
+                    {"text": "✅ Evet", "callback_data": "confirm_shutdown_hub"},
+                    {"text": "❌ Vazgeç", "callback_data": "confirm_cancel"},
+                ]]})
+            return
+        # Persistent reply-keyboard labels for Logs / Remote (review finding #1/#2)
+        if text.startswith("/logs") or text == self.msgs.btn_logs:
+            n = 20
+            parts = text.split()
+            if len(parts) > 1:
+                try:
+                    n = max(1, min(int(parts[1]), 50))
+                except ValueError:
+                    pass
+            sup = self._resolve_bare_target()
+            if sup is None:
+                await self._notify("⚠️ Multiple projects — open /status and use the buttons.")
+            else:
+                await self._send_logs_for(sup, n)
+            return
+        # Claude Code launcher buttons (reply-keyboard taps arrive as label text).
+        # Reuse the existing remote:{rid} callback path (fire-and-forget). The
+        # hub sentinel "__hub__" is handled by _route_callback → _handle_self_remote.
+        if text in self._remote_buttons:
+            await self._route_callback(f"remote:{self._remote_buttons[text]}", None)
+            return
+        # Bare per-target action verbs (start/restart/stop) — slash aliases only.
+        if text.startswith("/kutai_start"):
+            await self._for_bare_target("start")
+            return
+        for verb in ("start", "restart", "stop"):
+            if text.startswith("/" + verb):
+                await self._for_bare_target(verb)
+                return
+        if text.startswith("/"):
+            await self._send_dashboard()
+
+    async def _for_bare_target(self, verb: str) -> None:
+        """Apply a per-target verb to the sole supervisor, or reject if N>1
+        (spec R4: never guess a target)."""
+        sup = self._resolve_bare_target()
+        if sup is None:
+            await self._notify(
+                "⚠️ Multiple projects — open /status and use the buttons.")
+            return
+        await self._route_callback(f"{verb}:{sup.project_id}", None)
+
+    # ── Run ──────────────────────────────────────────────────────────────
+    async def run(self) -> None:
+        assert_hub_log_dir_absolute(self.cfg)
+        Path(self.cfg.log_dir).mkdir(parents=True, exist_ok=True)
+        # Deliberate-stop gate (I2): if /shutdown_hub left a hub.stopped marker,
+        # do NOT start — even under the every-3-min keep-alive trigger or a
+        # logon. This is what makes /shutdown_hub actually STAY down (the
+        # watchdog already skips its kill on this marker). NOT auto-cleared on
+        # boot: the stop survives reboots until the user starts on purpose
+        # (start_kutai.bat deletes the marker before `schtasks /Run`).
+        if (Path(self.cfg.log_dir) / "hub.stopped").exists():
+            logger.info("hub.stopped present — deliberate stop, not starting")
+            return
+        # Mutex is the singleton authority — gate BEFORE the file lock and any
+        # pre_boot cleanup, so a second hub exits before killing anything (§4.1).
+        self._acquire_singleton()
+        # Fail-loud boot gates: a credential-less hub runs with alerts silently
+        # dark, and a consumer venv that can't import yasar_usta would fail
+        # late in a managed child. Refuse to boot in either case — but only
+        # after the mutex, so a mutex-loser exits without paying the cost.
+        assert_hub_credentials(self.cfg)
+        assert_consumer_imports(self.projects)
+        acquire_lock(self.cfg.log_dir, name="hub")
+        logger.info("Hub started with %d supervisors", len(self.supervisors))
+
+        # pre_boot hooks (per project, once, after lock — spec finding #4).
+        for proj in self.projects:
+            run_pre_boot(proj)
+
+        offset = await self.telegram.flush_updates()
+        try:
+            _announce = self.msgs.announce.format(
+                name=self.cfg.name,
+                app_name=", ".join(p.name for p in self.projects))
+        except Exception:
+            _announce = f"🔧 *{self.cfg.name}* — {len(self.supervisors)} target(s) starting..."
+        await self._notify(_announce, reply_markup=self._kb())
+        if self.telegram.enabled:
+            self._telegram_poller = asyncio.create_task(self._poll_loop(offset))
+
+        # Hub self-liveness for the outer watchdog — a dedicated cadence task,
+        # decoupled from the crash/backoff loop so a 300s backoff sleep never
+        # reads as a hang (§7).
+        alive_writer = asyncio.create_task(
+            HeartbeatWriter(self._hub_alive_path(), interval=60).run())
+
+        sup_tasks = [asyncio.create_task(s.run()) for s in self.supervisors.values()]
+        watcher = asyncio.create_task(self._shutdown_watcher())
+        try:
+            # return_exceptions=True: a crashing supervisor must NOT propagate
+            # out of Hub.run() and kill the hub while orchestrators run headless.
+            results = await asyncio.gather(*sup_tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
+                    logger.error("supervisor task crashed: %r", r)
+        finally:
+            watcher.cancel()
+            alive_writer.cancel()
+            try:
+                await watcher
+            except asyncio.CancelledError:
+                pass
+            try:
+                await alive_writer
+            except asyncio.CancelledError:
+                pass
+            for t in list(self._bg_tasks):
+                t.cancel()
+            await self._stop_poller()
+        logger.info("Hub exiting.")
